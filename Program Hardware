@@ -1,0 +1,187 @@
+// ===============================================================
+//   GABUNGAN MQ-7, MQ-135, SDS011 + KIRIM FIREBASE (ESP32)
+// ===============================================================
+
+#include <Arduino.h>
+#include <SDS011.h>
+
+// ------------------- Firebase & WiFi -------------------
+#if defined(ESP32)
+  #include <WiFi.h>
+#elif defined(ESP8266)
+  #include <ESP8266WiFi.h>
+#endif
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+#define WIFI_SSID "Santo"
+#define WIFI_PASSWORD "rukun2021"
+#define API_KEY "AIzaSyD-hAMO7b-rjv0RklSBYJO8IkM8ZEc5lU0"
+#define DATABASE_URL "https://projekakhir-cff8d-default-rtdb.asia-southeast1.firebasedatabase.app"
+
+// Firebase objects
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+unsigned long lastSend = 0;
+bool signupOK = false;
+
+// ------------------- Konfigurasi Pin -------------------
+#define MQ7_PIN 39
+#define MQ135_PIN 36
+
+// ------------------- MQ-7 Config -------------------
+#define R0_DEFAULT_MQ7 53.03 
+#define VOLTAGE_MCU 3.3       
+#define ADC_RESOLUTION 4095.0 
+#define RL_VALUE_MQ7 10.0     
+#define PPM_A_CO 100 
+#define PPM_B_CO -1.53
+float R0_MQ7 = R0_DEFAULT_MQ7;
+
+// ------------------- MQ-135 Config -------------------
+#define R0_DEFAULT_MQ135 366.34
+#define RL_VALUE_MQ135 10.0
+#define PPM_A_CO2 116.6020682
+#define PPM_B_CO2 -2.769034857
+float R0_MQ135 = R0_DEFAULT_MQ135;
+
+// ------------------- SDS011 Config -------------------
+HardwareSerial sdsSerial(1);  // UART1
+SDS011 sds;
+
+// ===============================================================
+//   SETUP
+// ===============================================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  // ---------------- MQ-7 ----------------
+  Serial.println("Kalibrasi sensor MQ-7...");
+  Serial.print("Nilai R0 MQ-7: ");
+  Serial.println(R0_MQ7);
+  Serial.println("=================================");
+
+  // ---------------- MQ-135 ----------------
+  Serial.println("Kalibrasi sensor MQ-135...");
+  Serial.print("Nilai R0 MQ-135: ");
+  Serial.print(R0_MQ135);
+  Serial.println(" kΩ");
+  Serial.println("=================================");
+
+  // ---------------- SDS011 ----------------
+  Serial.println("Inisialisasi SDS011...");
+  sdsSerial.begin(9600, SERIAL_8N1, 16, 17);  // RX=GPIO16, TX=GPIO17
+  sds.begin(&sdsSerial);
+
+  // ---------------- WiFi ----------------
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to Wi-Fi");
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(300);
+  }
+  Serial.println();
+  Serial.print("Connected. IP: ");
+  Serial.println(WiFi.localIP());
+
+  // ---------------- Firebase ----------------
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  if (Firebase.signUp(&config, &auth, "", "")) {
+    Serial.println("Firebase SignUp OK");
+    signupOK = true;
+  } else {
+    Serial.printf("Firebase SignUp FAILED: %s\n", config.signer.signupError.message.c_str());
+  }
+  config.token_status_callback = tokenStatusCallback;
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+}
+
+// ===============================================================
+//   LOOP
+// ===============================================================
+void loop() {
+  // ---------------- MQ-7 ----------------
+  float current_Rs_MQ7 = get_Rs_MQ7();
+  float ratio_MQ7 = current_Rs_MQ7 / R0_MQ7;
+  float ppm_MQ7 = PPM_A_CO * pow(ratio_MQ7, PPM_B_CO);
+  //ppm_MQ7 = ppm_MQ7 - 90;
+  if (ppm_MQ7 < 0) ppm_MQ7 = 0;
+
+  // ---------------- MQ-135 ----------------
+  float current_Rs_MQ135 = get_Rs_MQ135();
+  float ratio_MQ135 = current_Rs_MQ135 / R0_MQ135;
+  float ppm_MQ135 = PPM_A_CO2 * pow(ratio_MQ135, PPM_B_CO2);
+
+  // ---------------- SDS011 ----------------
+  float pm25 = -1, pm10 = -1;
+  if (sds.read(&pm25, &pm10) != 0) {
+    pm25 = -1;
+    pm10 = -1;
+  }
+
+  // ---------------- OUTPUT SERIAL ----------------
+  Serial.println("=================================");
+  Serial.print("CO (PPM) MQ-7   : ");
+  Serial.println(ppm_MQ7);
+  Serial.print("CO2 (PPM) MQ-135: ");
+  Serial.println(ppm_MQ135);
+  Serial.print("PM2.5 (µg/m3)   : ");
+  if (pm25 >= 0) Serial.println(pm25); else Serial.println("Gagal baca");
+  Serial.print("PM10  (µg/m3)   : ");
+  if (pm10 >= 0) Serial.println(pm10); else Serial.println("Gagal baca");
+  Serial.println("=================================");
+
+  // ---------------- KIRIM FIREBASE ----------------
+  if (Firebase.ready() && signupOK && (millis() - lastSend > 10000 || lastSend == 0)) {
+    lastSend = millis();
+
+    if (Firebase.RTDB.setFloat(&fbdo, "/mq7/ppm", ppm_MQ7))
+      Serial.println("✅ MQ-7 berhasil dikirim");
+    else
+      Serial.println("❌ MQ-7 gagal: " + fbdo.errorReason());
+
+    if (Firebase.RTDB.setFloat(&fbdo, "/mq135/ppm", ppm_MQ135))
+      Serial.println("✅ MQ-135 berhasil dikirim");
+    else
+      Serial.println("❌ MQ-135 gagal: " + fbdo.errorReason());
+
+    if (Firebase.RTDB.setFloat(&fbdo, "/sds011/pm25", pm25))
+      Serial.println("✅ PM2.5 berhasil dikirim");
+    else
+      Serial.println("❌ PM2.5 gagal: " + fbdo.errorReason());
+
+    if (Firebase.RTDB.setFloat(&fbdo, "/sds011/pm10", pm10))
+      Serial.println("✅ PM10 berhasil dikirim");
+    else
+      Serial.println("❌ PM10 gagal: " + fbdo.errorReason());
+  }
+
+  delay(2000);
+}
+
+// ===============================================================
+//   Fungsi MQ-7
+// ===============================================================
+float get_Rs_MQ7() {
+  int adc_val = analogRead(MQ7_PIN);
+  float voltage = adc_val * (VOLTAGE_MCU / ADC_RESOLUTION);
+  if (voltage == 0) return 0;
+  float Rs = (VOLTAGE_MCU * RL_VALUE_MQ7 / voltage) - RL_VALUE_MQ7;
+  return Rs;
+}
+
+// ===============================================================
+//   Fungsi MQ-135
+// ===============================================================
+float get_Rs_MQ135() {
+  int adc_val = analogRead(MQ135_PIN);
+  float voltage = adc_val * (VOLTAGE_MCU / ADC_RESOLUTION);
+  if (voltage == 0) return 0;
+  float Rs = (VOLTAGE_MCU * RL_VALUE_MQ135 / voltage) - RL_VALUE_MQ135;
+  return Rs;
+}
